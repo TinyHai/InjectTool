@@ -1,69 +1,60 @@
 use std::{
     ffi::CString,
     fs::{self, File},
-    io::{self, BufRead, Write},
+    io::{self, BufRead},
     path::PathBuf,
     ptr::null_mut,
     thread::sleep,
     time::{Duration, Instant},
 };
-use std::ffi::CStr;
-use std::ptr::null;
+use std::ffi::c_void;
 
 use anyhow::anyhow;
-use clap::arg;
-use libc::{__u8, c_char, c_void, dlclose, dlerror, dlopen, dlsym, MAP_ANONYMOUS, MAP_PRIVATE, mmap, munmap, pid_t, PROT_EXEC, PROT_READ, PROT_WRITE, RTLD_GLOBAL, RTLD_NOW, tm, uintptr_t};
+use libc::{MAP_ANONYMOUS, MAP_PRIVATE, pid_t, PROT_EXEC, PROT_READ, PROT_WRITE, RTLD_NOW};
 use log::trace;
-use ndk_sys::{__ANDROID_API_M__, __ANDROID_API_N__};
+use ndk_sys::__ANDROID_API_N__;
 use paste::paste;
-use crate::fake_fdlcn::FakeDlfcn;
+use ptrace_do::{ProcessFrame, ProcessIdentifier, RawProcess, TracedProcess, UserRegs};
 
+use crate::fake_fdlcn::FakeDlfcn;
 use crate::process_wrapper::ProcessWrapper;
-#[cfg(target_arch = "aarch64")]
-use crate::ptrace_wrapper::PtraceWrapper;
 use crate::sys_lib::SysLib;
 
 struct InjectHelper {
-    pub target_libc_base: *mut c_void,
-    mmap_addr: *mut c_void,
-    munmap_addr: *mut c_void,
-    dlopen_addr: *mut c_void,
-    dlsym_addr: *mut c_void,
-    dlclose_addr: *mut c_void,
-    dlerror_addr: *mut c_void,
+    pub target_libc_base: usize,
+    mmap_addr: usize,
+    munmap_addr: usize,
+    dlopen_addr: usize,
+    dlsym_addr: usize,
+    dlclose_addr: usize,
+    dlerror_addr: usize,
 }
 
 macro_rules! pub_call_it {
     ($fun_name:ident) => {
         paste! {
-            pub fn [< call_ $fun_name>] (
+            pub fn [< call_ $fun_name>] <T> (
                 &self,
-                ptrace_wrapper: &PtraceWrapper,
-                parameters: &[u64],
-            ) -> anyhow::Result<u64> {
-                ptrace_wrapper.call(stringify!($fun_name), self.[< $fun_name _addr >], parameters)
+                proc_frame: ProcessFrame<T>,
+                parameters: &[usize],
+            ) -> anyhow::Result<(UserRegs, ProcessFrame<T>)> where T: ProcessIdentifier {
+                Self::call_by_addr(proc_frame, stringify!($fun_name), self.[< $fun_name _addr >], parameters)
             }
         }
     };
     ($($fun_name:ident),+) => {
         paste! {
             $(
-                pub fn [< call_ $fun_name>] (
+                pub fn [< call_ $fun_name>] <T> (
                     &self,
-                    ptrace_wrapper: &PtraceWrapper,
-                    parameters: &[u64],
-                ) -> anyhow::Result<u64> {
-                    ptrace_wrapper.call(stringify!($fun_name), self.[< $fun_name _addr >], parameters)
+                    proc_frame: ProcessFrame<T>,
+                    parameters: &[usize],
+                ) -> anyhow::Result<(UserRegs, ProcessFrame<T>)> where T: ProcessIdentifier {
+                    Self::call_by_addr(proc_frame, stringify!($fun_name), self.[< $fun_name _addr >], parameters)
                 }
             )+
         }
     }
-}
-
-macro_rules! cstr {
-    ($ident:ident) => {
-        CString::new(stringify!($ident)).unwrap()
-    };
 }
 
 impl InjectHelper {
@@ -120,13 +111,6 @@ impl InjectHelper {
         trace!("dlclose_addr: 0x{:X}", dlclose_addr);
         trace!("dlerror_addr: 0x{:X}", dlerror_addr);
 
-        let mmap_addr = mmap_addr as *mut c_void;
-        let munmap_addr = munmap_addr as *mut c_void;
-        let dlopen_addr = dlopen_addr as *mut c_void;
-        let dlsym_addr = dlsym_addr as *mut c_void;
-        let dlclose_addr = dlclose_addr as *mut c_void;
-        let dlerror_addr = dlerror_addr as *mut c_void;
-
         let target_libc_base = target_process.get_so_base(&libc_path).ok_or(anyhow!(
             "get base from remote {} failed",
             target_process.get_pid()
@@ -142,17 +126,17 @@ impl InjectHelper {
         })
     }
 
-    pub fn call_by_addr(
-        ptrace_wrapper: &PtraceWrapper,
+    pub fn call_by_addr<T>(
+        proc_frame: ProcessFrame<T>,
         fun_name: &str,
-        fun_addr: *mut c_void,
-        parameters: &[u64],
-    ) -> anyhow::Result<u64> {
-        ptrace_wrapper.call(fun_name, fun_addr, parameters)
+        fun_addr: usize,
+        parameters: &[usize],
+    ) -> anyhow::Result<(UserRegs, ProcessFrame<T>)> where T: ProcessIdentifier {
+        trace!("call {}, addr: 0x{:X}", fun_name, fun_addr);
+        Ok(proc_frame.invoke_remote(fun_addr, 0, parameters)?)
     }
 
 
-    #[cfg(target_arch = "aarch64")]
     pub_call_it!(mmap, munmap, dlopen, dlsym, dlclose, dlerror);
 
     fn with_base<F>(
@@ -182,11 +166,16 @@ impl InjectHelper {
 }
 
 pub fn inject_so_to_pid(pid: pid_t, so_path: &str) -> anyhow::Result<()> {
-    let so_path = PathBuf::from(so_path);
-    let so_path_str = CString::new(so_path.to_str()).unwrap();
-    let mut parameters = [0u64; 8];
-    let mut ptrace_target = PtraceWrapper::attach(pid)?;
-    let sys_lib = SysLib::new(find_pid_by_cmd("zygote64", Duration::from_secs(1)).unwrap());
+    let so_path = fs::canonicalize(PathBuf::from(so_path)).unwrap();
+    let so_path_str = CString::new(so_path.to_str().unwrap()).unwrap();
+
+    let zygote_pid = if cfg!(any(target_arch = "arm", target_arch = "x86")) {
+        find_pid_by_cmd("zygote", Duration::from_secs(1))
+    } else {
+        find_pid_by_cmd("zygote64", Duration::from_secs(1))
+    }.unwrap();
+
+    let sys_lib = SysLib::new(zygote_pid);
     trace!("{:?}", sys_lib);
 
     let libc_path = PathBuf::from(sys_lib.get_libc_path());
@@ -194,201 +183,113 @@ pub fn inject_so_to_pid(pid: pid_t, so_path: &str) -> anyhow::Result<()> {
 
     let inject_helper = InjectHelper::new(pid, sys_lib)?;
 
-    ptrace_target.backup_regs()?;
-
-    ptrace_target.set_libc_base(inject_helper.target_libc_base as usize);
+    let mut parameters = Vec::<usize>::new();
+    let traced_proc = TracedProcess::attach(RawProcess::new(pid))?;
+    let proc_frame = traced_proc.next_frame()?;
+    // ptrace_target.set_libc_base(inject_helper.target_libc_base as usize);
 
     let mmap_size = 0x3000;
     let mmap_params = prepare_mmap_params(
         &mut parameters,
-        null_mut(),
+        0,
         mmap_size,
         PROT_READ | PROT_WRITE | PROT_EXEC,
         MAP_PRIVATE | MAP_ANONYMOUS,
     );
 
-    let mmap_base = inject_helper.call_mmap(&ptrace_target, mmap_params)? as *const u8;
+    let (regs, mut proc_frame) = inject_helper.call_mmap(proc_frame, mmap_params)?;
+    let mmap_base = regs.return_value();
 
     let so_path_bytes = so_path_str.as_bytes_with_nul();
-    ptrace_target.write_data(
-        mmap_base as *const _,
-        so_path_bytes as *const _ as *const _,
-        so_path_bytes.len(),
-    );
+    (&mut proc_frame).write_memory(mmap_base, so_path_bytes)?;
 
     let dlopen_params = prepare_dlopen_params(&mut parameters, mmap_base as _, RTLD_NOW);
-    let handle = inject_helper.call_dlopen(&ptrace_target, dlopen_params)? as *mut c_void;
-    if handle.is_null() {
-        let dlerror = inject_helper.call_dlerror(&ptrace_target, &parameters)? as *const u8;
-        let mut buff = vec![];
-        let mut tmp = 0u8;
-        let mut count = 0usize;
-        loop {
-            ptrace_target.read_data(unsafe { dlerror.add(count) }, &mut tmp, 1);
-            count += 1;
-            if tmp == 0 {
-                break;
-            }
-            buff.push(tmp);
-        }
-        trace!("dlerror: {}", String::from_utf8(buff).unwrap().as_str());
-    }
+    let (regs, proc_frame) = inject_helper.call_dlopen(proc_frame, dlopen_params)?;
+    let handle = regs.return_value();
 
-    // if !handle.is_null() {
+    let proc_frame = if handle == 0 {
+        let (regs, proc_frame) = inject_helper.call_dlerror(proc_frame, &[])?;
+        let dlerror = regs.return_value();
+        let mut buff = vec![0u8; 256];
+        let read = proc_frame.read_memory_mut(dlerror, &mut buff)?;
+        buff.truncate(read);
+        if let Some(idx) = buff.iter().rposition(|&x| x == 0) {
+            buff.truncate(idx)
+        }
+        trace!("dlerror: {}", String::from_utf8_lossy(&buff));
+        proc_frame
+    } else {
+        proc_frame
+    };
+
+    // if handle == 0 {
     //     let dlclose_params = prepare_dlclose_params(&mut parameters, handle);
-    //     inject_helper.call_dlclose(&ptrace_target, dlclose_params)?;
+    //     inject_helper.call_dlclose(proc_frame, dlclose_params)?;
     // }
 
     let munmap_params = prepare_munmap_params(&mut parameters, mmap_base as _, mmap_size);
-    inject_helper.call_munmap(&ptrace_target, munmap_params)?;
+    let (_, _) = inject_helper.call_munmap(proc_frame, munmap_params)?;
 
-    ptrace_target.restore_regs()?;
     Ok(())
 }
 
-#[cfg(target_arch = "aarch64")]
-// pub fn inject_path_to_pid(pid: pid_t, path_to_add: &str) -> anyhow::Result<()> {
-//     const PATH: &[u8] = b"PATH\0";
-//
-//     let mut parameters = [0u64; 8];
-//     let mut ptrace_target = PtraceWrapper::attach(pid)?;
-//     let inject_helper = InjectHelper::new(pid)?;
-//
-//     ptrace_target.backup_regs()?;
-//
-//     let mmap_size = 0x4000;
-//     let mmap_params = prepare_mmap_params(
-//         &mut parameters,
-//         null_mut(),
-//         mmap_size,
-//         PROT_READ | PROT_WRITE | PROT_EXEC,
-//         MAP_ANONYMOUS | MAP_PRIVATE,
-//     );
-//     let mmap_base = inject_helper.call_mmap(&ptrace_target, mmap_params)? as *mut c_void;
-//
-//     ptrace_target.write_data(
-//         mmap_base as *const _,
-//         PATH as *const _ as *const _,
-//         PATH.len(),
-//     )?;
-//
-//     let getenv_params = prepare_getenv_params(&mut parameters, mmap_base as *const _);
-//     let origin_env_addr = inject_helper.call_getenv(&ptrace_target, getenv_params)? as *const u8;
-//
-//     let mut buff = vec![];
-//     buff.write_all(path_to_add.as_bytes())?;
-//     buff.push(b':');
-//     let mut tmp = 0u8;
-//     let mut count = 0;
-//     loop {
-//         ptrace_target.read_data(unsafe { origin_env_addr.add(count) }, &mut tmp, 1)?;
-//         count += 1;
-//         if tmp == 0 {
-//             break;
-//         }
-//         buff.push(tmp);
-//     }
-//     let complete_env = String::from_utf8(buff)?;
-//     trace!("will setenv: {}", &complete_env);
-//     let c_str = CString::new(complete_env).unwrap();
-//     let bytes_to_write = c_str.as_bytes_with_nul();
-//     ptrace_target.write_data(
-//         unsafe { mmap_base.add(PATH.len()) as _ },
-//         bytes_to_write.as_ptr(),
-//         bytes_to_write.len(),
-//     )?;
-//
-//     let setenv_params = prepare_setenv_params(
-//         &mut parameters,
-//         mmap_base as _,
-//         unsafe { mmap_base.add(PATH.len()) as _ },
-//         1,
-//     );
-//     let result = inject_helper.call_setenv(&ptrace_target, setenv_params)?;
-//     if result != 0 {
-//         return Err(anyhow!("setenv failed, code: {}", result));
-//     }
-//
-//     let getenv_params = prepare_getenv_params(&mut parameters, mmap_base as *const _);
-//     let latest_env_addr = inject_helper.call_getenv(&ptrace_target, getenv_params)? as *const u8;
-//     let mut buff = vec![];
-//     let mut tmp = 0u8;
-//     let mut count = 0;
-//     loop {
-//         ptrace_target.read_data(unsafe { latest_env_addr.add(count) }, &mut tmp, 1)?;
-//         count += 1;
-//         if tmp == 0 {
-//             break;
-//         }
-//         buff.push(tmp);
-//     }
-//     let latest_env = String::from_utf8(buff)?;
-//     trace!("lastest env: {}", latest_env);
-//
-//     let munmap_params = prepare_munmap_params(&mut parameters, mmap_base, mmap_size);
-//     inject_helper.call_munmap(&ptrace_target, munmap_params)?;
-//
-//     ptrace_target.restore_regs()?;
-//     Ok(())
-// }
 macro_rules! prepare_params {
     ($params:ident, $($arg:ident),+) => {{
-        let mut idx = 0;
+        ($params).clear();
         $(
-            ($params)[idx] = $arg as u64;
-            idx += 1;
+            ($params).push(($arg) as _);
         )+
-        &($params)[0..idx]
+        &($params)[..]
     }};
 }
 
 fn prepare_mmap_params(
-    parameters: &mut [u64],
-    addr: *mut c_void,
+    parameters: &mut Vec<usize>,
+    addr: usize,
     size: usize,
     prot: i32,
     flags: i32,
-) -> &[u64] {
+) -> &[usize] {
     let fd = 0;
     let offset = 0;
     prepare_params!(parameters, addr, size, prot, flags, fd, offset)
 }
 
 fn prepare_munmap_params(
-    parameters: &mut [u64],
-    addr: *const c_void,
+    parameters: &mut Vec<usize>,
+    addr: usize,
     size: usize,
-) -> &[u64] {
+) -> &[usize] {
     prepare_params!(parameters, addr, size)
 }
 
 fn prepare_dlopen_params(
-    parameters: &mut [u64],
-    so_path: *const c_void,
+    parameters: &mut Vec<usize>,
+    so_path_addr: usize,
     flags: i32,
-) -> &[u64] {
-    prepare_params!(parameters, so_path, flags)
+) -> &[usize] {
+    prepare_params!(parameters, so_path_addr, flags)
 }
 
 fn prepare_dlsym_params(
-    parameters: &mut [u64],
-    handle: *mut c_void,
-    symbol: *const c_char,
-) -> &[u64] {
+    parameters: &mut Vec<usize>,
+    handle: usize,
+    symbol: usize,
+) -> &[usize] {
     prepare_params!(parameters, handle, symbol)
 }
 
 fn prepare_dlclose_params(
-    parameters: &mut [u64],
-    handle: *mut c_void,
-) -> &[u64] {
+    parameters: &mut Vec<usize>,
+    handle: usize,
+) -> &[usize] {
     prepare_params!(parameters, handle)
 }
 
 fn prepare_inject_entry_params(
-    parameters: &mut [u64],
-    arg: *mut c_void,
-) -> &[u64] {
+    parameters: &mut Vec<usize>,
+    arg: usize,
+) -> &[usize] {
     prepare_params!(parameters, arg)
 }
 

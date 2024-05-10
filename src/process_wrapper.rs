@@ -6,19 +6,20 @@ use std::{
 };
 
 use libc::pid_t;
+use ptrace_do::ProcessIdentifier;
 
 pub struct ProcessWrapper {
-    pid: libc::pid_t,
+    pid: pid_t,
 }
 
 impl ProcessWrapper {
-    pub fn new(pid: libc::pid_t) -> Self {
+    pub fn new(pid: pid_t) -> Self {
         Self { pid: pid }
     }
 
     pub fn myself() -> Self {
         Self {
-            pid: process::id() as i32,
+            pid: process::id() as pid_t,
         }
     }
 
@@ -60,5 +61,11 @@ impl ProcessWrapper {
             }
         }
         None
+    }
+}
+
+impl ProcessIdentifier for ProcessWrapper {
+    fn pid(&self) -> pid_t {
+        self.pid
     }
 }

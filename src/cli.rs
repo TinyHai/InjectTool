@@ -1,17 +1,29 @@
-use std::{
-    fs::{self, set_permissions, DirBuilder, Permissions},
-    os::unix::{prelude::PermissionsExt, process::CommandExt},
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use core::fmt;
+use std::{io, path::PathBuf, time::Duration};
+use std::any::Any;
+use std::cell::OnceCell;
+use std::ffi::{CStr, CString};
+use std::fmt::Write;
+use std::io::{ErrorKind, Read};
+use std::marker::PhantomData;
+use std::sync::OnceLock;
 
 #[cfg(target_os = "android")]
 use android_logger::Config;
-use anyhow::{anyhow, Ok, Result};
+use android_logger::{AndroidLogger, PlatformLogWriter};
+use anyhow::{Ok, Result};
 
 use clap::{Parser, Subcommand};
-use log::trace;
+use clap::builder::Str;
+use log::{Level, Log, trace};
 use log::LevelFilter;
+use tracing::instrument::WithSubscriber;
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::fmt::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Registry;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::inject::{find_pid_by_cmd, inject_so_to_pid};
 
@@ -45,13 +57,51 @@ enum Commands {
     },
 }
 
+struct PlatformLogWriterWrapper {
+    level: Level,
+    tag: CString,
+}
+
+impl PlatformLogWriterWrapper {
+    fn get_writer(&mut self) -> PlatformLogWriter {
+        PlatformLogWriter::new(None, self.level, &self.tag)
+    }
+}
+
+impl io::Write for PlatformLogWriterWrapper {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let len = buf.len();
+        let mut writer = self.get_writer();
+        writer.write_str(&String::from_utf8_lossy(buf)).map_err(|e| io::Error::from(ErrorKind::Other))?;
+        writer.flush();
+        Result::Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Result::Ok(())
+    }
+}
+
+static LOG_GUARD: OnceLock<DefaultGuard> = OnceLock::new();
+
 pub fn run() -> Result<()> {
-    #[cfg(target_os = "android")]
-    android_logger::init_once(
-        Config::default()
+    if cfg!(target_os = "android") {
+        let tag = "InjectTool";
+        let config = Config::default()
             .with_max_level(LevelFilter::Trace) // limit log level
-            .with_tag("SK_CLI"), // logs will show under mytag tag
-    );
+            .with_tag(tag); // logs will show under mytag tag
+        android_logger::init_once(config);
+        let dispatcher = tracing_subscriber::FmtSubscriber::builder()
+            .with_writer(move || {
+                let tag_cstr = CString::new(tag).unwrap();
+                PlatformLogWriterWrapper { level: Level::Trace, tag: tag_cstr }
+            })
+            .with_ansi(false)
+            .without_time()
+            .with_level(false)
+            .finish();
+        LOG_GUARD.get_or_init(|| tracing::subscriber::set_default(dispatcher));
+    };
 
     let args = Args::parse();
     match args.commands {

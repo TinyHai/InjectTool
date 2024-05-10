@@ -1,8 +1,6 @@
-use std::io;
-use std::io::{BufRead, Error};
-use std::os::unix::prelude::CommandExt;
+use std::io::BufRead;
 use std::path::Path;
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use anyhow::anyhow;
 use log::trace;
 

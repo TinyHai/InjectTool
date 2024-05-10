@@ -1,8 +1,6 @@
 mod cli;
 mod inject;
 mod process_wrapper;
-mod ptrace_wrapper;
-
 mod android_os;
 mod sys_lib;
 mod fake_fdlcn;

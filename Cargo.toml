@@ -12,6 +12,9 @@ anyhow = "1.0.70"
 paste = "1.0.12"
 libc = "0.2.153"
 log = "0.4.21"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+ptrace-do = { git = "https://github.com/TinyHai/ptrace-do" }
 
 [target.'cfg(target_os="android")'.dependencies]
 android_logger = "0.13.1"

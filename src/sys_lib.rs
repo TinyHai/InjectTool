@@ -1,6 +1,5 @@
-use std::ops::Deref;
 use libc::pid_t;
-use ndk_sys::{__ANDROID_API_Q__, __ANDROID_API_R__};
+
 use crate::process_wrapper::ProcessWrapper;
 
 #[derive(Debug)]
@@ -13,9 +12,7 @@ pub struct SysLib {
 }
 
 impl SysLib {
-    #[cfg(target_arch = "aarch64")]
     pub fn new(pid: pid_t) -> Self {
-        // let os_api = crate::android_os::sdk::api().unwrap_or(0);
         let proc = ProcessWrapper::new(pid);
 
         let get_lib_path = |lib_name: &str| -> String {
@@ -23,7 +20,10 @@ impl SysLib {
         };
 
         let libc = get_lib_path("libc.so");
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let linker = get_lib_path("linker64");
+        #[cfg(any(target_arch = "arm", target_arch = "x86"))]
+        let linker = get_lib_path("linker");
         let libdl = get_lib_path("libdl.so");
         let libart = get_lib_path("libart.so");
         let libandroid_runtime = get_lib_path("libandroid_runtime.so");
@@ -35,25 +35,6 @@ impl SysLib {
             libart,
             libandroid_runtime
         }
-        // if os_api >= __ANDROID_API_R__ {
-        //     Self {
-        //         libc: "/apex/com.android.runtime/lib64/bionic/libc.so",
-        //         linker: "/apex/com.android.runtime/bin/linker64",
-        //         libdl: "/apex/com.android.runtime/lib64/bionic/libdl.so"
-        //     }
-        // } else if os_api >= __ANDROID_API_Q__ {
-        //     Self {
-        //         libc: "/apex/com.android.runtime/lib64/bionic/libc.so",
-        //         linker: "/apex/com.android.runtime/bin/linker64",
-        //         libdl: "/apex/com.android.runtime/lib64/bionic/libdl.so"
-        //     }
-        // } else {
-        //     Self {
-        //         libc: "/system/lib64/libc.so",
-        //         linker: "/system/bin/linker64",
-        //         libdl: "/system/lib64/libdl.so"
-        //     }
-        // }
     }
 
     pub fn get_libc_path(&self) -> &str {
